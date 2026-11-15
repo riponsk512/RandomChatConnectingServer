@@ -17,24 +17,25 @@ const io = new Server(server, {
     origin: "*",
     methods: ["GET", "POST"],
   },
-  maxHttpBufferSize: 1e7, // 10 MB buffer for HD images & voice messages
-  pingInterval: 4000,
-  pingTimeout: 8000,
+  maxHttpBufferSize: 1e7,
+  pingInterval: 2500, // Fast 2.5s ping so internet/data off is detected almost immediately
+  pingTimeout: 4000,  // 4.0s timeout on dead mobile data or app kill
   transports: ["websocket", "polling"],
 });
 
 const PORT = process.env.PORT || 5000;
 
 // ============================================================================
-// ⚙️ LIFECYCLE CONSTANTS
+// ⚙️ LIFECYCLE CONSTANTS (FAST DISCONNECT & HEARTBEAT DETECTION)
 // ============================================================================
 const SERVER_INSTANCE_ID = `csrv_${Date.now()}_${crypto
   .randomBytes(4)
   .toString("hex")}`;
-const QUEUE_MAX_WAIT_MS = 10000; // Strict 10.0s maximum matchmaking queue duration
-const QUEUE_HEARTBEAT_EXPIRY_MS = 4500; // Evict waiting user if queue pings stop > 4.5s
-const ACTIVE_CHAT_DISCONNECT_TIMEOUT_MS = 10000; // 10s grace for Wi-Fi <-> Cellular switch
-const PROTECTED_DIALOG_GRACE_MS = 30000; // 30s grace while picking gallery image, camera, or permissions
+const QUEUE_MAX_WAIT_MS = 10000;
+const QUEUE_HEARTBEAT_EXPIRY_MS = 4500;
+const ACTIVE_CHAT_DISCONNECT_TIMEOUT_MS = 3000; // 3s grace on abrupt internet loss / app kill
+const ROOM_HEARTBEAT_EXPIRY_MS = 9500;          // Auto-destroy room if a user stops pinging for 9.5s
+const PROTECTED_DIALOG_GRACE_MS = 25000;
 
 function logEvent(category, message, details = null) {
   const ts = new Date().toISOString();
@@ -49,19 +50,20 @@ function logEvent(category, message, details = null) {
 }
 
 // ============================================================================
-// 🗂️ IN-MEMORY STORES ONLY (ZERO DATABASE STORAGE)
+// 🗂️ IN-MEMORY STORES
 // ============================================================================
-const waitingQueue = new Map(); // emailKey -> queueEntry
-const activeRooms = new Map(); // roomId (20-char) -> roomObject
-const userToSocket = new Map(); // emailKey -> socket.id
-const socketToUser = new Map(); // socket.id -> emailKey
-const userToRoom = new Map(); // emailKey -> roomId
-const userSessionGen = new Map(); // emailKey -> integer generation counter
-const cancelledAttempts = new Set(); // attemptId
-const userProtectedUntil = new Map(); // emailKey -> timestamp
-const matchingLocks = new Set(); // emailKey (atomic 1-to-1 lock)
-const queueTimers = new Map(); // emailKey -> Timeout (10s matchmaking timer)
-const disconnectTimers = new Map(); // emailKey -> Timeout
+const waitingQueue = new Map();
+const activeRooms = new Map();
+const userToSocket = new Map();
+const socketToUser = new Map();
+const userToRoom = new Map();
+const userLastSeen = new Map();
+const userSessionGen = new Map();
+const cancelledAttempts = new Set();
+const userProtectedUntil = new Map();
+const matchingLocks = new Set();
+const queueTimers = new Map();
+const disconnectTimers = new Map();
 
 const ID_CHARS =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -126,8 +128,10 @@ function removeFromWaitingQueue(
 function bindUserSocket(email, socket) {
   if (!email || !socket) return null;
   const emailKey = String(email).trim().toLowerCase();
+  const now = Date.now();
 
   clearDisconnectTimer(emailKey);
+  userLastSeen.set(emailKey, now);
 
   const prevSocketId = userToSocket.get(emailKey);
   if (prevSocketId && prevSocketId !== socket.id) {
@@ -146,14 +150,19 @@ function bindUserSocket(email, socket) {
   const qEntry = waitingQueue.get(emailKey);
   if (qEntry) {
     qEntry.socketId = socket.id;
-    qEntry.lastPing = Date.now();
+    qEntry.lastPing = now;
   }
 
   const activeRoomId = userToRoom.get(emailKey);
   if (activeRoomId && activeRooms.has(activeRoomId)) {
     socket.join(activeRoomId);
-    const room = activeRooms.get(activeRoomId);
-    room.lastHeartbeat = Date.now();
+    const rm = activeRooms.get(activeRoomId);
+    rm.lastHeartbeat = now;
+    if (String(rm.caller || "").toLowerCase() === emailKey) {
+      rm.callerLastPing = now;
+    } else {
+      rm.calleeLastPing = now;
+    }
   }
 
   return emailKey;
@@ -178,7 +187,14 @@ function validateSignalingParticipant(roomId, socket, explicitEmail = null) {
   const recipientKey = senderKey === callerKey ? calleeKey : callerKey;
   if (userToRoom.get(recipientKey) !== roomId) return null;
 
-  room.lastHeartbeat = Date.now();
+  const now = Date.now();
+  room.lastHeartbeat = now;
+  userLastSeen.set(senderKey, now);
+  if (senderKey === callerKey) {
+    room.callerLastPing = now;
+  } else {
+    room.calleeLastPing = now;
+  }
 
   return {
     room,
@@ -218,10 +234,7 @@ function evaluateCompatibility(userA, userB) {
         (userA.age && userA.age <= userB.filterAgeMax)));
 
   if (!aMatchesB) {
-    return {
-      compatible: false,
-      reason: `${userA.email} did not match ${userB.email}'s filters`,
-    };
+    return { compatible: false };
   }
 
   const aHasFilters =
@@ -237,7 +250,7 @@ function evaluateCompatibility(userA, userB) {
     ((!userA.filterGender ||
       userA.filterGender === "Both" ||
       String(userA.filterGender).toLowerCase() === genderB) &&
-      (!userA.filterLocation ||
+      (!userA.location ||
         (userB.location &&
           String(userB.location).toLowerCase() ===
             String(userA.filterLocation).toLowerCase())) &&
@@ -248,14 +261,7 @@ function evaluateCompatibility(userA, userB) {
       (!userA.filterAgeMax ||
         (userB.age && userB.age <= userA.filterAgeMax)));
 
-  if (!bMatchesA) {
-    return {
-      compatible: false,
-      reason: `${userB.email} did not match ${userA.email}'s filters`,
-    };
-  }
-
-  return { compatible: true, reason: "Bidirectional filters matched" };
+  return { compatible: Boolean(bMatchesA) };
 }
 
 function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
@@ -269,7 +275,6 @@ function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
   room.calleeCandidates = [];
   room.inChatCallOffer = null;
   room.inChatCallAnswer = null;
-  room.callCandidates = [];
   activeRooms.delete(roomId);
 
   const callerKey = String(room.caller || "").toLowerCase();
@@ -288,21 +293,12 @@ function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
   if (calleeSockId) io.sockets.sockets.get(calleeSockId)?.leave(roomId);
 
   const partnerKey = leaverKey === callerKey ? calleeKey : callerKey;
-  const partnerEmail = leaverKey === callerKey ? room.callee : room.caller;
   const partnerSocketId = userToSocket.get(partnerKey);
-
-  const durationSec = Math.round(
-    (Date.now() - (room.createdAtMs || Date.now())) / 1000
-  );
 
   logEvent("ROOM_DESTROYED", `Chat room ${roomId} terminated & wiped`, {
     roomId,
-    caller: room.caller,
-    callee: room.callee,
     endedBy: leaverEmail || "system",
     reason,
-    durationSec: `${durationSec}s`,
-    remainingActiveRooms: activeRooms.size,
   });
 
   if (!partnerSocketId) return;
@@ -344,19 +340,12 @@ function destroyRoomAndNotifyPartner(roomId, leaverEmail, reason = "ended") {
     by: leaverEmail,
     timestamp: Date.now(),
   });
-
-  logEvent("PARTNER_NOTIFIED", `Notified ${partnerEmail} of chat room end`, {
-    roomId,
-    reason: cleanReason,
-  });
 }
 
 // ============================================================================
 // ⚡ SOCKET.IO CONNECTION & REAL-TIME ENGINE
 // ============================================================================
 io.on("connection", (socket) => {
-  logEvent("SOCKET_CONNECTED", `New chat socket connected: ${socket.id}`);
-
   socket.emit("server_hello", {
     serverInstanceId: SERVER_INSTANCE_ID,
     timestamp: Date.now(),
@@ -366,23 +355,25 @@ io.on("connection", (socket) => {
     const emailKey = socketToUser.get(socket.id);
     if (!emailKey) return;
     const now = Date.now();
-
+    userLastSeen.set(emailKey, now);
     const qEntry = waitingQueue.get(emailKey);
-    if (qEntry) {
-      qEntry.lastPing = now;
-    }
-
+    if (qEntry) qEntry.lastPing = now;
     const rId = userToRoom.get(emailKey);
     if (rId && activeRooms.has(rId)) {
-      activeRooms.get(rId).lastHeartbeat = now;
+      const rm = activeRooms.get(rId);
+      rm.lastHeartbeat = now;
+      if (String(rm.caller || "").toLowerCase() === emailKey) {
+        rm.callerLastPing = now;
+      } else {
+        rm.calleeLastPing = now;
+      }
     }
   });
 
-  // 1. REGISTER USER
   socket.on("register_user", (payload) => {
     if (!payload?.email) return;
     const email = String(payload.email).trim();
-    const emailKey = bindUserSocket(email, socket);
+    bindUserSocket(email, socket);
 
     if (payload.roomId && !activeRooms.has(payload.roomId)) {
       socket.emit("room_ended", {
@@ -392,15 +383,8 @@ io.on("connection", (socket) => {
         timestamp: Date.now(),
       });
     }
-
-    logEvent("USER_REGISTERED", `Chat user registered: ${email}`, {
-      socketId: socket.id,
-      screen: payload.screen || "unknown",
-      activeRoomId: userToRoom.get(emailKey) || null,
-    });
   });
 
-  // 2. GALLERY / CAMERA / PERMISSION DIALOG PROTECTION FLAG
   socket.on("ad_status", (payload) => {
     const email = payload?.email || socketToUser.get(socket.id);
     if (!email) return;
@@ -412,7 +396,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 3. JOIN MATCHMAKING QUEUE (Strict 10s Timeout, Atomic 1-to-1 Pairing)
   socket.on("queue_join", (payload) => {
     if (!payload?.email) return;
     const myEmail = String(payload.email).trim();
@@ -487,11 +470,6 @@ io.on("connection", (socket) => {
       lastPing: now,
     };
 
-    logEvent("QUEUE_JOIN", `🔍 Chat user searching: ${myEmail}`, {
-      attemptId: myEntry.attemptId,
-      waitingInQueue: waitingQueue.size,
-    });
-
     let matchedPartner = null;
 
     for (const [candKey, candidate] of waitingQueue.entries()) {
@@ -526,7 +504,6 @@ io.on("connection", (socket) => {
       }
     }
 
-    // 🎉 1-TO-1 CHAT MATCH ESTABLISHED
     if (matchedPartner) {
       const partnerKey = matchedPartner.email.toLowerCase();
       removeFromWaitingQueue(myKey, "matched_1_to_1", false);
@@ -548,7 +525,6 @@ io.on("connection", (socket) => {
       }
 
       const roomId = generateRoomId(20);
-      const waitTimeMs = now - matchedPartner.joinedAt;
 
       const callerProfile = {
         email: matchedPartner.email,
@@ -595,9 +571,10 @@ io.on("connection", (socket) => {
         inChatCallOffer: null,
         inChatCallAnswer: null,
         inChatCallAction: null,
-        callCandidates: [],
         lastGift: null,
         lastHeartbeat: now,
+        callerLastPing: now,
+        calleeLastPing: now,
         createdAt: new Date(now).toISOString(),
         createdAtMs: now,
         callerEnteredInCall: false,
@@ -612,16 +589,6 @@ io.on("connection", (socket) => {
 
       partnerSock.join(roomId);
       mySock.join(roomId);
-
-      logEvent(
-        "MATCH_ESTABLISHED",
-        `🎉 1-TO-1 CHAT MATCH: ${matchedPartner.email} (Caller) <-> ${myEntry.email} (Callee)`,
-        {
-          roomId,
-          partnerWaitTimeMs: `${waitTimeMs}ms`,
-          activeRoomsTotal: activeRooms.size,
-        }
-      );
 
       io.to(matchedPartner.socketId).emit("match_established_sync", {
         roomId,
@@ -675,7 +642,6 @@ io.on("connection", (socket) => {
     queueTimers.set(myKey, expiryTimer);
   });
 
-  // 4. QUEUE PING
   socket.on("queue_ping", (payload) => {
     if (!payload?.email) return;
     const emailKey = bindUserSocket(payload.email, socket);
@@ -683,7 +649,13 @@ io.on("connection", (socket) => {
     const qEntry = waitingQueue.get(emailKey);
     if (qEntry) qEntry.lastPing = now;
     if (payload.roomId && activeRooms.has(payload.roomId)) {
-      activeRooms.get(payload.roomId).lastHeartbeat = now;
+      const rm = activeRooms.get(payload.roomId);
+      rm.lastHeartbeat = now;
+      if (String(rm.caller || "").toLowerCase() === emailKey) {
+        rm.callerLastPing = now;
+      } else {
+        rm.calleeLastPing = now;
+      }
     }
     socket.emit("queue_pong", {
       attemptId: payload.attemptId || null,
@@ -691,7 +663,6 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 5. LEAVE QUEUE / ABORT
   socket.on("queue_leave", (payload) => {
     const email = payload?.email || socketToUser.get(socket.id);
     if (!email) return;
@@ -715,7 +686,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 6. ENTERED RANDOMCHATSCREEN
   socket.on("entered_incall", (payload) => {
     const { roomId, email, role } = payload || {};
     const key = email ? bindUserSocket(email, socket) : null;
@@ -730,23 +700,23 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const now = Date.now();
     const room = activeRooms.get(roomId);
     if (
       String(role).toLowerCase() === "caller" ||
       key === String(room.caller).toLowerCase()
     ) {
       room.callerEnteredInCall = true;
+      room.callerLastPing = now;
     } else {
       room.calleeEnteredInCall = true;
+      room.calleeLastPing = now;
     }
     room.enteredInCall = true;
-    room.lastHeartbeat = Date.now();
+    room.lastHeartbeat = now;
     socket.join(roomId);
   });
 
-  // ==========================================================================
-  // 💬 RANDOM CHAT & IN-CHAT CALL SIGNALING (0ms INSTANT RELAY)
-  // ==========================================================================
   socket.on("join_room", (payload, callback) => {
     const { roomId, email } = payload || {};
     if (!roomId) return;
@@ -760,6 +730,7 @@ io.on("connection", (socket) => {
       return;
     }
 
+    const now = Date.now();
     const emailKey = email ? bindUserSocket(email, socket) : null;
     const callerKey = String(room.caller || "").toLowerCase();
     const calleeKey = String(room.callee || "").toLowerCase();
@@ -775,11 +746,17 @@ io.on("connection", (socket) => {
     if (emailKey) {
       removeFromWaitingQueue(emailKey, "joined_active_room", false);
       userToRoom.set(emailKey, roomId);
-      if (emailKey === callerKey) room.callerEnteredInCall = true;
-      if (emailKey === calleeKey) room.calleeEnteredInCall = true;
+      if (emailKey === callerKey) {
+        room.callerEnteredInCall = true;
+        room.callerLastPing = now;
+      }
+      if (emailKey === calleeKey) {
+        room.calleeEnteredInCall = true;
+        room.calleeLastPing = now;
+      }
       room.enteredInCall = true;
     }
-    room.lastHeartbeat = Date.now();
+    room.lastHeartbeat = now;
 
     if (typeof callback === "function") {
       callback({ exists: true, room });
@@ -787,7 +764,6 @@ io.on("connection", (socket) => {
 
     socket.emit("room_snapshot", room);
 
-    // Replay buffered Chat WebRTC Offer/Answer/Candidates immediately
     if (emailKey === calleeKey && room.offer) {
       socket.emit("webrtc_offer", { roomId, offer: room.offer });
     }
@@ -845,7 +821,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Direct Socket Relay for Chat Messages, Voice Messages, Images & In-Chat Call Packets
   socket.on("chat_event", (payload) => {
     const { roomId } = payload || {};
     if (!roomId) return;
@@ -901,7 +876,6 @@ io.on("connection", (socket) => {
     validateSignalingParticipant(roomId, socket, email);
   });
 
-  // 7. EXPLICIT EXIT EVENTS
   const handleExplicitExit = (defaultReason) => (payload) => {
     const email =
       (typeof payload === "object" && payload?.email) ||
@@ -935,7 +909,6 @@ io.on("connection", (socket) => {
   socket.on("videobackground", handleExplicitExit("background"));
   socket.on("checkInternet", handleExplicitExit("disconnected"));
 
-  // 8. SOCKET DISCONNECT (FORCE-CLOSE & NETWORK LOSS DETECTION)
   socket.on("disconnect", (disconnectReason) => {
     const emailKey = socketToUser.get(socket.id);
     if (!emailKey) return;
@@ -960,7 +933,7 @@ io.on("connection", (socket) => {
       ? PROTECTED_DIALOG_GRACE_MS
       : room.enteredInCall
       ? ACTIVE_CHAT_DISCONNECT_TIMEOUT_MS
-      : 600;
+      : 500;
 
     clearDisconnectTimer(emailKey);
     const timer = setTimeout(() => {
@@ -980,10 +953,12 @@ io.on("connection", (socket) => {
 });
 
 // ============================================================================
-// ⏱️ 1-SECOND QUEUE SWEEPER ONLY (ACTIVE ROOMS HAVE UNLIMITED DURATION!)
+// ⏱️ 1-SECOND SWEEPER (QUEUE EXPIRY + DEAD INTERNET/APP-KILL ROOM WATCHDOG)
 // ============================================================================
 setInterval(() => {
   const now = Date.now();
+
+  // 1. Sweep waiting queue
   for (const [emailKey, entry] of waitingQueue.entries()) {
     const sock = io.sockets.sockets.get(entry.socketId);
     const isSocketDead = !sock || !sock.connected;
@@ -1006,6 +981,25 @@ setInterval(() => {
           timestamp: now,
         });
       }
+    }
+  }
+
+  // 2. Sweep active rooms for silent internet drops / force-killed apps
+  for (const [roomId, room] of activeRooms.entries()) {
+    if (room.status !== "active") continue;
+    const callerKey = String(room.caller || "").toLowerCase();
+    const calleeKey = String(room.callee || "").toLowerCase();
+
+    const callerProtected = (userProtectedUntil.get(callerKey) || 0) > now;
+    const calleeProtected = (userProtectedUntil.get(calleeKey) || 0) > now;
+
+    const callerSilentMs = now - (room.callerLastPing || room.createdAtMs || now);
+    const calleeSilentMs = now - (room.calleeLastPing || room.createdAtMs || now);
+
+    if (!callerProtected && callerSilentMs > ROOM_HEARTBEAT_EXPIRY_MS) {
+      destroyRoomAndNotifyPartner(roomId, room.caller, "disconnected");
+    } else if (!calleeProtected && calleeSilentMs > ROOM_HEARTBEAT_EXPIRY_MS) {
+      destroyRoomAndNotifyPartner(roomId, room.callee, "disconnected");
     }
   }
 }, 1000);
