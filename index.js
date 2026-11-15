@@ -11,15 +11,14 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
   },
   maxHttpBufferSize: 1e7,
-  pingInterval: 2500, // Fast 2.5s ping to detect internet loss / app kill quickly
-  pingTimeout: 4000,  // 4.0s timeout on dead connection
+  pingInterval: 5000,
+  pingTimeout: 10000,
   transports: ["websocket", "polling"],
 });
 
@@ -30,8 +29,8 @@ const SERVER_INSTANCE_ID = `csrv_${Date.now()}_${crypto
   .toString("hex")}`;
 const QUEUE_MAX_WAIT_MS = 10000;
 const QUEUE_HEARTBEAT_EXPIRY_MS = 4500;
-const ACTIVE_CHAT_DISCONNECT_TIMEOUT_MS = 2500; // 2.5s grace on abrupt disconnect / app kill
-const ROOM_HEARTBEAT_EXPIRY_MS = 8500;          // 8.5s watchdog for silent internet/data loss
+const ACTIVE_CHAT_DISCONNECT_TIMEOUT_MS = 5000;
+const ROOM_HEARTBEAT_EXPIRY_MS = 15000;
 const PROTECTED_DIALOG_GRACE_MS = 25000;
 
 function logEvent(category, message, details = null) {
