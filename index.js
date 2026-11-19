@@ -18,8 +18,8 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
   maxHttpBufferSize: 1e7,
-  pingInterval: 2000, // 2.0s fast ping detects internet off / app kill almost immediately
-  pingTimeout: 3000,  // 3.0s timeout on dead connection
+  pingInterval: 5000,
+  pingTimeout: 12000,
   transports: ["websocket", "polling"],
 });
 
@@ -30,10 +30,9 @@ const SERVER_INSTANCE_ID = `csrv_${Date.now()}_${crypto
   .toString("hex")}`;
 const QUEUE_MAX_WAIT_MS = 10000;
 const QUEUE_HEARTBEAT_EXPIRY_MS = 4500;
-const ACTIVE_CHAT_DISCONNECT_TIMEOUT_MS = 1800; // 1.8s fast teardown on app kill / socket drop
-const ROOM_HEARTBEAT_EXPIRY_MS = 6500;          // 6.5s watchdog on silent mobile data / Wi-Fi off
+const ACTIVE_CHAT_DISCONNECT_TIMEOUT_MS = 6000; // 6s grace prevents false drops on mobile data spikes
+const ROOM_HEARTBEAT_EXPIRY_MS = 20000;         // 20s silent-network sweeper
 const PROTECTED_DIALOG_GRACE_MS = 25000;
-
 function logEvent(category, message, details = null) {
   const ts = new Date().toISOString();
   if (details !== null && details !== undefined) {
